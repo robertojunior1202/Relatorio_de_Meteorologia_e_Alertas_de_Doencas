@@ -1,0 +1,923 @@
+'''-------------------------------------------------------------------------------------'''
+                                        #Importações
+'''-------------------------------------------------------------------------------------'''
+import requests
+import json
+import pandas as pd
+import numpy as np
+import datetime
+import mysql.connector
+import pytz
+from PIL import Image, ImageDraw, ImageFont
+from fpdf import FPDF
+import PyPDF2
+import tempfile
+import plotly as px
+import plotly.graph_objects as go
+from PIL import Image
+import io
+from dateutil import parser
+from datetime import datetime,timedelta
+import calendar
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import win32com.client as win32
+ 
+'''-------------------------------------------------------------------------------------'''
+                                        #Parametros de Desempenho
+'''-------------------------------------------------------------------------------------'''
+localizacao = pytz.timezone('America/Sao_Paulo')
+data_hora_atual = datetime.now(localizacao)
+data_inicio = data_hora_atual.strftime('%d/%m/%Y' ' %H:%M:%S')
+data_inicio_obj = datetime.strptime(data_inicio, '%d/%m/%Y %H:%M:%S')
+
+
+'''-------------------------------------------------------------------------------------'''
+                                        #Definindo Constantes
+'''-------------------------------------------------------------------------------------'''
+#Tempo que considera a estação off - Esta opção impacta no envio dos relatórios
+timeoff = 300 #em minutos
+
+#Data que refere a partir de quando os dados vão ser recebidos - Dados Históricos
+qtd_dias = 7
+
+#Configurando Período de Safra e Nome
+nome_safra = "Verão"   #Verão ou Inverno
+mes_inicio_safra = "Setembro"
+mes_inicio_safra_num = 9
+ano_inicio_safra_num = 2023
+
+#Previsão
+sensibilidade_probabilidade = 1
+
+#Alertas
+alerta_frio = 3  #alerta de geada disparado quando temperatura menor de 3°C
+cultura_alerta = "Trigo"  #Trigo, Milho, Soja
+
+
+'''-------------------------------------------------------------------------------------'''
+                                        #Calculos Iniciais
+'''-------------------------------------------------------------------------------------'''
+localizacao = pytz.timezone('America/Sao_Paulo')
+data_hora_atual = datetime.now(localizacao)
+data_atual = data_hora_atual.strftime('%d/%m/%Y' ' %H')
+
+data_inicial = datetime.now() - timedelta(days=qtd_dias)
+data_inicial = data_inicial.strftime('%d/%m/%Y') + " 00"
+
+
+
+'''-------------------------------------------------------------------------------------'''
+                                        #Conectando a API
+'''-------------------------------------------------------------------------------------'''
+
+api_key = 'insira_api_key'
+url = 'https://prod-api.plugfield.com.br/login'
+headers = {
+    'x-api-key': api_key,
+    'Content-Type': 'application/json'
+}
+data = {
+    'username': 'insira_seu_username',
+    'password': 'insira_o_password'
+}
+
+response = requests.post(url, headers=headers, data=json.dumps(data))
+
+if response.status_code == 200:
+    response_json = response.json()
+    token = response.json()['access_token']
+    print("Login bem-sucedido. Token:", token)
+else:
+    print("Erro no login. Código de status:", response.status_code)
+    print("Resposta:", response.text)
+
+
+
+'''-------------------------------------------------------------------------------------'''
+                #Retornando Todos as Estações Cadastradas no Usuário
+'''-------------------------------------------------------------------------------------'''
+
+url_estacoes = 'https://prod-api.plugfield.com.br/device?page=1'
+headers = {
+    'Content-Type': 'application/json',
+    'Authorization': token,
+    'x-api-key': api_key
+}
+
+response2 = requests.get(url_estacoes, headers=headers)
+
+if response2.status_code == 200:
+    # Sucesso! A solicitação GET foi bem-sucedida.
+    estacoes = response2.json()
+    estacoes_list = estacoes['deviceList']
+    # Faça algo com os dados retornados.
+    print("Resposta:", estacoes)
+else:
+    # Houve um erro durante a solicitação GET.
+    print("Erro na solicitação GET. Código de status:", response2.status_code)
+    print("Resposta:", response2.text)
+    
+    
+    
+'''-------------------------------------------------------------------------------------'''
+                    #Extraindo Lista de Sensores - ID
+'''-------------------------------------------------------------------------------------'''
+
+colunas_sensores = ['ID','Code','Nome','Unit','OrderNumber']
+sensores_info = pd.DataFrame(columns=colunas_sensores, dtype=object)
+for i in range(0, len(estacoes_list[0]['sensorList'])):
+    id = estacoes_list[0]['sensorList'][i]['id']
+    code = estacoes_list[0]['sensorList'][i]['code']
+    name = estacoes_list[0]['sensorList'][i]['name']
+    unit = estacoes_list[0]['sensorList'][i]['unit']
+    orderNumber = estacoes_list[0]['sensorList'][i]['orderNumber']
+    dados = [id,code,name,unit,orderNumber]
+    temp = pd.DataFrame([dados], columns=colunas_sensores)
+    #sensores_info = sensores_info.append(temp, ignore_index=True)
+    sensores_info = pd.concat([sensores_info, temp], ignore_index=True)
+
+
+
+
+'''-------------------------------------------------------------------------------------'''
+                   #Extraindo Id, Nome e Serial das Estações
+'''-------------------------------------------------------------------------------------'''
+
+colunas_matriz = ['ID','Nome', 'Serial']
+estacoes_info = pd.DataFrame(columns=colunas_matriz, dtype=object)
+for i in range(0, len(estacoes_list)):
+    id =  estacoes_list[i]['id']
+    name = estacoes_list[i]['name']
+    serial = estacoes_list[i]['serialNumber']
+    dados = [id,name,serial]
+    temp = pd.DataFrame([dados], columns=colunas_matriz)
+    estacoes_info = pd.concat([estacoes_info, temp], ignore_index=True)
+
+
+
+'''-------------------------------------------------------------------------------------'''
+    #Extraindo Informações das Estações - Dashboard
+'''-------------------------------------------------------------------------------------'''
+colunas_matriz_dados_estacoes = ['ID_Estacao','Nome', 'Serial', 'Municipio','Estado','UF', 'Latitude', 'Longitude', 'Altitude', 
+                                 'Data Ultima Atualizacao', 'Status']
+dados_estacoes_meteorologicas = pd.DataFrame(columns=colunas_matriz_dados_estacoes , dtype=object)
+
+colunas_matriz_dados_meteorologicos = ['ID_Estacao','Temperatura Atual', 'Temperatura Min', 'Temperatura Max',
+                                       'Ponto Orvalho', 'Sensacao Termica', 'Umidade', 'Delta T', 'Delta Min', 'Delta Max',
+                                       'Precipitacao Dia', 'Evapotranspiracao', 'Vento Medio', 'Rajada', 'Direcao',
+                                       'Pressao Atm','UV','Luminosidade','Radiacao','Bateria','Hora Leitura','Data Leitura']
+dados_meteorologicos = pd.DataFrame(columns=colunas_matriz_dados_meteorologicos, dtype=object)
+
+
+# Obter a data e hora atuais
+localizacao = pytz.timezone('America/Sao_Paulo')
+data_hora_atual = datetime.now(localizacao)
+data_hora_formatada = data_hora_atual.strftime('%Y-%m-%d %H:%M:%S')
+
+
+for estacao in range(len(estacoes_list)):
+    #Dados Estações
+     id_estacao = estacoes_list[estacao]['id']
+     nome_estacao = estacoes_list[estacao]['name']
+     serial_estacao = estacoes_list[estacao]['serialNumber']
+     municipio_estacao = estacoes_list[estacao]['city']
+     estado = estacoes_list[estacao]['region']
+     if estado =='Paraná' or estado =='Parana' :
+         uf = 'PR'
+     elif estado =='Goiás' or estado =='Goias':
+         uf = 'GO'
+     elif estado =='Minas Gerais':
+         uf = 'MG'
+     else:
+         uf = ''
+     latitude_estacao = float(estacoes_list[estacao]['latitude']) 
+     longitude_estacao = float(estacoes_list[estacao]['longitude'])
+     altitude_estacao = float(estacoes_list[estacao]['altitude'])
+     
+     dt = datetime.fromtimestamp(estacoes_list[estacao]['dashboard']['lastUpdateTimestamp'] / 1000)
+     dt_ultima_atualizacao = dt.strftime('%Y-%m-%d %H:%M:%S')
+     
+     #Conferindo se a estação está atualizando pela data de ultima atualização
+     confere_data_hora = datetime.strptime(data_hora_formatada, '%Y-%m-%d %H:%M:%S') - timedelta(minutes=timeoff)
+     if datetime.strptime(dt_ultima_atualizacao, '%Y-%m-%d %H:%M:%S') > confere_data_hora:
+         #print("A estação está atualizando normalmente")
+         status = "ON"  
+     else:
+         print(f"A estação não {nome_estacao} está atualizando")
+         status = "OFF"
+ 
+         
+     dados_estacoes = [id_estacao,nome_estacao,serial_estacao,municipio_estacao,estado,uf,
+              latitude_estacao,longitude_estacao,altitude_estacao,dt_ultima_atualizacao, status]
+     temp = pd.DataFrame([dados_estacoes], columns=colunas_matriz_dados_estacoes)
+     dados_estacoes_meteorologicas = pd.concat([dados_estacoes_meteorologicas, temp], ignore_index=True)
+
+     
+
+     #Dados Meteorológicos
+     temperatura_atual = estacoes_list[estacao]['dashboard']['temp']
+     temperatura_min = estacoes_list[estacao]['dashboard']['tempMin']
+     temperatura_max = estacoes_list[estacao]['dashboard']['tempMax']
+     ponto_orvalho = estacoes_list[estacao]['dashboard']['duep']
+     sensacao_termica = estacoes_list[estacao]['dashboard']['feel']
+     umidade = estacoes_list[estacao]['dashboard']['humi']
+     deltaT = estacoes_list[estacao]['dashboard']['deltat']
+     deltaTMin = estacoes_list[estacao]['dashboard']['deltatMin']
+     deltaTMax = estacoes_list[estacao]['dashboard']['deltatMax']
+     precipitacao_dia = estacoes_list[estacao]['dashboard']['rainDay'] 
+     evapotranspiracao = float(estacoes_list[estacao]['dashboard']['evapDay'])
+     vento_medio = estacoes_list[estacao]['dashboard']['wind']
+     rajada = estacoes_list[estacao]['dashboard']['winb']
+     direcao = estacoes_list[estacao]['dashboard']['direString']
+     pressao_atm = estacoes_list[estacao]['dashboard']['prre']
+     uv = estacoes_list[estacao]['dashboard']['uv']
+     luminosidade = estacoes_list[estacao]['dashboard']['radi'] #conferir
+     radiacao = estacoes_list[estacao]['dashboard']['radiation']
+     bateria = estacoes_list[estacao]['dashboard']['bat']
+    
+     dt = datetime.fromtimestamp(estacoes_list[estacao]['dashboard']['lastUpdateTimestamp'] / 1000)
+     hora_formatada = dt.strftime('%Y-%m-%d %H:%M:%S')
+     data_leitura, hora_leitura = hora_formatada.split(' ')
+    
+    
+    
+    
+     dados_met = [id_estacao,temperatura_atual,temperatura_min,temperatura_max,ponto_orvalho,sensacao_termica,
+                 umidade,deltaT,deltaTMin,deltaTMax,precipitacao_dia,evapotranspiracao,vento_medio,rajada,
+                 direcao,pressao_atm,uv,luminosidade,radiacao,bateria,hora_leitura,data_leitura]
+     temp = pd.DataFrame([dados_met], columns=colunas_matriz_dados_meteorologicos)
+     dados_meteorologicos = pd.concat([dados_meteorologicos, temp], ignore_index=True)
+
+
+#Ajustando São João d'aliança para São João da Aliança
+# Filtra os dados para 'São João d'Aliança'
+condition = dados_estacoes_meteorologicas['Nome'] == "São João d'Aliança"
+filtered_indices = dados_estacoes_meteorologicas.index[condition]
+
+# Usa .loc para modificar os valores na coluna 'Nome'
+dados_estacoes_meteorologicas.loc[filtered_indices, 'Nome'] = "São João da Aliança"
+
+#Copia de dados_estacoes_meteorologicas para Envio de Email
+relacao_relatorios = dados_estacoes_meteorologicas.copy()
+
+#Adiconando Regionais e Ids
+colunas_matriz_dados_estacoes = ['ID_Estacao','Nome', 'Serial', 'Municipio','Estado','UF', 'Latitude', 'Longitude', 'Altitude', 
+                                 'Data Ultima Atualizacao', 'Status']
+
+#Add Paraná Baixo
+prBaixo = [10,"Paraná Baixo","","","Paraná","PR","","","","","ON"]
+temp = pd.DataFrame([prBaixo], columns=colunas_matriz_dados_estacoes)
+relacao_relatorios = pd.concat([relacao_relatorios, temp], ignore_index=True)
+
+#Add Paraná Alto
+prAlto = [20,"Paraná Alto","","","Paraná","PR","","","","","ON"]
+temp = pd.DataFrame([prAlto], columns=colunas_matriz_dados_estacoes)
+relacao_relatorios = pd.concat([relacao_relatorios, temp], ignore_index=True)
+
+#Add Campos Gerais
+camposGerais = [30,"Campos Gerais","","","Paraná","PR","","","","","ON"]
+temp = pd.DataFrame([camposGerais], columns=colunas_matriz_dados_estacoes)
+relacao_relatorios = pd.concat([relacao_relatorios, temp], ignore_index=True)
+
+#Add Cerrado Goiano
+cerradoGoiano = [40,"Cerrado Goiano","","","Goiás","GO","","","","","ON"]
+temp = pd.DataFrame([cerradoGoiano], columns=colunas_matriz_dados_estacoes)
+relacao_relatorios = pd.concat([relacao_relatorios, temp], ignore_index=True)
+
+#Add Cerrado Mineiro
+cerradoMineiro = [50,"Cerrado Mineiro","","","Minas Gerais","MG","","","","","ON"]
+temp = pd.DataFrame([cerradoMineiro], columns=colunas_matriz_dados_estacoes)
+relacao_relatorios = pd.concat([relacao_relatorios, temp], ignore_index=True)
+
+
+#Salvando Excel
+escrever = pd.ExcelWriter(f'Logs/Dados das Estações Meteorológicas.xlsx')
+relacao_relatorios.to_excel(escrever, 'Dados', index =False)
+escrever.save()
+
+escrever = pd.ExcelWriter(f'Logs/Dados Meteorológicos.xlsx')
+dados_meteorologicos.to_excel(escrever, 'Dados', index =False)
+escrever.save()
+
+'''-------------------------------------------------------------------------------------'''
+                  #Extraindo Informações dos Ultimos 7 Dias de Hora em Hora
+'''-------------------------------------------------------------------------------------''' 
+dados_estacoes_hora = ['ID_Estacao','TempMed','TempMax','TempMin','DeltaT','DeltaTMax','DeltaTMin','Vento','Rajada Vento','DirecaoVento',
+                       'Chuva','Umidade','Radiacao','Pressao','UV','HoraLeitura','DataLeitura']
+dados_meteorologicos_hora = pd.DataFrame(columns=dados_estacoes_hora , dtype=object)
+
+
+#Requisição API
+url = 'https://prod-api.plugfield.com.br/data/hourly'
+headers = {
+    'Content-Type': 'application/json',
+    'Authorization': token,
+    'x-api-key': api_key
+}
+lista_info_dias = []
+#Capturando Lista dos Dados Meteorologicos
+for i in range(0,len(estacoes_info)):
+    device = estacoes_info["ID"][i]
+    params = {
+        'device': device,
+        'begin': data_inicial,
+        'end': data_atual}
+    
+    response3 = requests.get(url, headers=headers, params=params)
+    lista_info = response3.json()
+    lista_info_dias.append(lista_info)
+    print(f"Captando Dados Meteorológicos dos Ultimos {qtd_dias} dias \n Etapa {i} de {len(estacoes_info)}")
+    
+    
+#Tratando Dados e Add na lista
+for i in range (0, len(lista_info_dias)):
+    for j in range(0,len(lista_info_dias[i])):
+        id_estacao = lista_info_dias[i][j]['deviceId']
+        tempMin = lista_info_dias[i][j]['tempMin']
+        tempMax = lista_info_dias[i][j]['tempMax']
+        tempMed =(lista_info_dias[i][j]['tempMax'] + lista_info_dias[i][j]['tempMin'])/2
+        deltat = lista_info_dias[i][j]['deltat']
+        deltatMax = lista_info_dias[i][j]['deltatMax']
+        deltatMin = lista_info_dias[i][j]['deltatMin']
+        vento = lista_info_dias[i][j]['wind']
+        rajada = lista_info_dias[i][j]['windBurst']
+        direcao_vento = lista_info_dias[i][j]['directionString']
+        chuva = lista_info_dias[i][j]['rain']
+        umidade = lista_info_dias[i][j]['humidity']
+        radiacao = lista_info_dias[i][j]['radiation']
+        pressao = lista_info_dias[i][j]['pressure']
+        uv = lista_info_dias[i][j]['uv']
+        data_hora_objeto = parser.parse(lista_info_dias[i][j]['localDateTime'])
+        hora_leitura = data_hora_objeto.strftime('%H:%M')
+        data_leitura = data_hora_objeto.strftime('%d-%m-%Y')
+        
+        dados_hora= [id_estacao,tempMed,tempMax,tempMin,deltat,deltatMax,deltatMin,vento,rajada,direcao_vento,chuva,umidade,
+                 radiacao,pressao,uv,hora_leitura,data_leitura]
+        temp = pd.DataFrame([dados_hora], columns=dados_estacoes_hora)
+        dados_meteorologicos_hora = pd.concat([dados_meteorologicos_hora, temp], ignore_index=True)
+        print(f"Tratando Dados Meteorológicos dos Ultimos {qtd_dias} dias \n Etapa {i} de {len(lista_info_dias)} - {j} de {len(lista_info_dias[i])-1} ")
+    
+        
+'''-------------------------------------------------------------------------------------'''
+                  #Extraindo Informações de Chuva no Mês
+'''-------------------------------------------------------------------------------------''' 
+dados_chuva = ['ID_Estacao','ChuvaMes']
+dados_chuva_mes = pd.DataFrame(columns=dados_chuva , dtype=object)
+for i in range(0,len(estacoes_list)):
+    id_estacao = estacoes_list[i]['dashboard']['deviceId']
+    chuva_mes = estacoes_list[i]['dashboard']['rainMonth']
+    dados= [id_estacao,chuva_mes]
+    temp = pd.DataFrame([dados], columns=dados_chuva)
+    dados_chuva_mes = pd.concat([dados_chuva_mes, temp], ignore_index=True)
+
+
+'''-------------------------------------------------------------------------------------'''
+                  #Extraindo Informações de Chuva na Safra
+'''-------------------------------------------------------------------------------------''' 
+
+dados_chuva2 = ['ID_Estacao','ChuvaSafra']
+dados_chuva_safra= pd.DataFrame(columns=dados_chuva2 , dtype=object)
+
+
+begin = f"01/{mes_inicio_safra_num:02d}/{ano_inicio_safra_num}"
+end = data_hora_atual.strftime('%d/%m/%Y')
+
+
+url = 'https://prod-api.plugfield.com.br/data/daily'
+headers = {
+    'Content-Type': 'application/json',
+    'Authorization': token,
+    'x-api-key': api_key
+}
+
+for i in range(0,len(dados_estacoes_meteorologicas)):#len(dados_estacoes_meteorologicas)
+    device = estacoes_info['ID'][i]
+    params = {
+        "device": device,
+        'begin': begin,
+        'end': end
+    }
+    
+    response = requests.get(url, params=params, headers=headers)
+    response_dados = response.json()
+    chuva_safra = 0
+    for j in range(0, len(response_dados)):
+        chuva = round(response_dados[j]['rainAccum'],1)
+        chuva_safra+=chuva
+    
+    dados = [device,chuva_safra]
+    temp = pd.DataFrame([dados], columns=dados_chuva2)
+    dados_chuva_safra = pd.concat([dados_chuva_safra, temp], ignore_index=True)
+    print(f"Extraindo Chuva Safra - {i} de {len(dados_estacoes_meteorologicas)-1}")
+
+
+
+        
+'''-------------------------------------------------------------------------------------'''
+                  #Extraindo Informações de Previsão 7 Dias - Climatempo PRO
+'''-------------------------------------------------------------------------------------''' 
+previsao = pd.read_excel('Arquivos-essenciais/previsao.xls')
+colunas_previsao = ['Municipio','Chuva','Probabilidade','TempMax','TempMin','Cad','Data']
+dados_previsao = pd.DataFrame(columns=colunas_previsao , dtype=object)
+linha_municipio = 0
+linha_inicial = 3
+linha_final = 17
+
+while linha_final < len(previsao):
+    municipio = str(previsao['Unnamed: 0'][linha_municipio].split("-")[2]) + "-" + str(previsao['Unnamed: 0'][linha_municipio].split("-")[3]) 
+    for j in range(linha_inicial,linha_final+1):
+        data = previsao['Unnamed: 0'][j]
+        chuva = previsao['Unnamed: 5'][j]
+        probabilidade = previsao['Unnamed: 7'][j]
+        tempMax = previsao['Unnamed: 3'][j]
+        tempMin = previsao['Unnamed: 1'][j]
+        cad = previsao['Unnamed: 19'][j]
+        dados = [municipio,chuva,probabilidade,tempMax,tempMin,cad,data]
+        temp = pd.DataFrame([dados], columns=colunas_previsao)
+        dados_previsao = pd.concat([dados_previsao, temp], ignore_index=True)
+    linha_municipio += 19
+    linha_inicial +=19
+    linha_final +=19 
+    
+   
+dict_previsao_estacoes = {"1928":"São João D Aliança - GO","2044":"Caixa São Pedro - PR","1969":"Caixa São Pedro - PR","773":"Caixa São Pedro - PR",
+                          "766":"Bom Sucesso - PR","1050":"Borrazópolis - PR","760":"Cambira - PR","768":"Campo Alegre de Goiás - GO",
+                          "1872":"Campo Alegre de Goiás - GO","635":"Catalão - GO","746":"Coromandel - MG","772":"Cristalina - GO",
+                          "1871":"Cristalina - GO","881":"Cruzmaltina - PR","1938":"Cruzmaltina - PR","743":"Cruzmaltina - PR",
+                          "897":"Faxinal - PR","776":"Faxinal - PR","872":"Faxinal - PR","724":"Guarda-Mor ","2948":"Imbituva - PR",
+                          "764":"Imbituva - PR","1899":"Ipameri - GO","790":"Ipameri - GO","1864":"Ipameri - GO","2213":"Ipameri - GO",
+                          "734":"Itambé - PR","757":"Ivaí - PR","1885":"Jandaia do Sul - PR","1946":"Jandaia do Sul - PR",
+                          "745":"Jandaia do Sul - PR","878":"Placa Luar - PR","767":"Placa Luar - PR","777":"Kaloré - PR",
+                          "1916":"Lunardelli - PR","754":"Lunardelli - PR","753":"Mandaguari - PR","812":"Mandaguari - PR",
+                          "1961":"Aquidaban - PR","1910":"Marialva - PR","732":"Marialva - PR","751":"São Luiz - PR",
+                          "747":"Marilândia do Sul - PR","1892":"Marumbi - PR","793":"Marumbi - PR","1939":"Novo Itacolomi - PR",
+                          "1919":"Novo Itacolomi - PR","1922":"Novo Itacolomi - PR","1964":"Novo Itacolomi - PR","756":"Novo Itacolomi - PR",
+                          "1930":"Orizona - GO","758":"Orizona - GO","3134":"Ortigueira - PR","2120":"Ortigueira - PR","781":"Ortigueira - PR",
+                          "749":"Ponta Grossa - PR","770":"Rosário do Ivaí - PR","1866":"Rio Brando do Ivaí - PR","736":"Rio Brando do Ivaí - PR",
+                          "1952":"Rosário do Ivaí - PR","772":"São João D Aliança - GO","1883":"São João D Aliança - GO",
+                          "2043":"São Pedro do Ivaí - PR","796":"São Pedro do Ivaí - PR","1907":"Marilândia do Sul - PR",
+                          "1887":"Ipameri - GO","1868":"Silvânia - GO","728":"Silvânia - GO","755":"São Pedro do Ivaí - PR", "722" : "Cristalina - GO"}
+#dict_previsao_estacoes["722"]
+    
+'''-------------------------------------------------------------------------------------'''
+       #Ajustando Informações de Grupo Filial na Tabela Dados Estacões Meteorológicos
+'''-------------------------------------------------------------------------------------'''
+grupos_filiais = pd.read_excel("Arquivos-essenciais/Grupos_Filiais.xlsx")
+dados_estacoes_meteorologicas["GrupoFilial"] = ""
+for i in range(0, len(dados_estacoes_meteorologicas)):
+    try:
+        id_estacao_ajuste = dados_estacoes_meteorologicas["ID_Estacao"][i]
+        linha = grupos_filiais[grupos_filiais["ID_Estacao"]==id_estacao_ajuste]
+        linha = linha["Grupo"].iloc[0]
+        dados_estacoes_meteorologicas["GrupoFilial"][i]=linha
+    except:
+        pass
+
+
+'''-------------------------------------------------------------------------------------'''
+                  #Montando Relatório Meteorologico
+'''-------------------------------------------------------------------------------------'''        
+
+for estacao in range(0,len(dados_estacoes_meteorologicas)): #len(dados_estacoes_meteorologicas)
+    try:
+        # Carregando Template
+        if dados_estacoes_meteorologicas["Status"][estacao] =="ON":
+            img = Image.open('Arquivos-essenciais/TEMPLATE PARA ALERTAS CLIMÁTICOS (Verao)-1.png')
+          
+        else:
+            img = Image.open('Arquivos-essenciais/TEMPLATE PARA ALERTAS CLIMÁTICOS (Verao) - Offline-1.png')
+         
+            
+        img = img.convert('RGB')
+        
+        # Criar um objeto ImageDraw
+        draw = ImageDraw.Draw(img)
+        
+        # Escrevendo Informações na imagem
+        #Filial
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 55)
+        filial = dados_estacoes_meteorologicas['Municipio'][estacao] + " - " + dados_estacoes_meteorologicas['UF'][estacao]
+        id_estacao = dados_estacoes_meteorologicas['ID_Estacao'][estacao] 
+        nome_estacao = dados_estacoes_meteorologicas['Nome'][estacao]  + " - " + dados_estacoes_meteorologicas['UF'][estacao]
+        draw.text((235, 60), nome_estacao, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        #Data
+        # Obter a data e hora atuais
+        localizacao = pytz.timezone('America/Sao_Paulo')
+        data_hora_atual = datetime.now(localizacao)
+        data_formatada = data_hora_atual.strftime('%d-%m-%Y')
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 30)
+        draw.text((1450, 163), data_formatada, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        #Ultima Atualização - Estação
+        ultima_atualizacao = dados_estacoes_meteorologicas['Data Ultima Atualizacao'][estacao]
+        ultima_atualizacao = datetime.strptime(ultima_atualizacao, '%Y-%m-%d %H:%M:%S')
+        # Formatar a data no formato desejado: '18/07/2023 - 10:26'
+        ultima_atualizacao = ultima_atualizacao.strftime('%d/%m/%Y ás %H:%M')
+        ultima_atualizacao = f"Ultima Atualização - {ultima_atualizacao}"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 30)
+        draw.text((1100, 225), ultima_atualizacao, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        #Temperatura Hoje - Previsão
+        temp_atual = float(list(dados_meteorologicos[dados_meteorologicos['ID_Estacao']== id_estacao]['Temperatura Atual'])[0])
+        temp_atual = str(temp_atual) + "°C"
+        #Puxar da Previsao
+        localizacao = pytz.timezone('America/Sao_Paulo')
+        data_hora_atual = datetime.now(localizacao)
+        data_hoje = data_hora_atual.strftime('%d/%m/%Y')
+        nome_previsao = dict_previsao_estacoes[str(id_estacao)]
+         
+        previsao_dia = dados_previsao[dados_previsao["Data"]==data_hoje]
+        previsao_dia = previsao_dia[previsao_dia["Municipio"]==" "+str(nome_previsao)]
+      
+        temp_min = str(previsao_dia["TempMin"].iloc[0]) + "°C  |"
+        temp_max = str(previsao_dia["TempMax"].iloc[0]) + "°C"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 35)
+        draw.text((300, 271), temp_atual, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        font1 = ImageFont.truetype('calibrilight/calibril.ttf', 32)
+        draw.text((345, 305), temp_max, font=font1, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        draw.text((240, 305), temp_min, font=font1, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        #Temperatura Ontem
+        data_ontem = datetime.now() - timedelta(days=1)
+        data_ontem = data_ontem.strftime('%d-%m-%Y')
+        
+        a = dados_meteorologicos_hora[(dados_meteorologicos_hora['ID_Estacao']==id_estacao)] 
+        a = a[(a['DataLeitura']==data_ontem)]
+    
+        temp_max_ontem = str(a['TempMax'].max()) + "°C"
+        temp_min_ontem = str(a['TempMin'].min()) + "°C  |"
+        temp_ontem = str(round((a['TempMax'].max()+a['TempMin'].min())/2,1)) + "°C"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 35)
+        draw.text((600, 271), temp_ontem, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        font1 = ImageFont.truetype('calibrilight/calibril.ttf', 32)
+        draw.text((675, 305), temp_max_ontem, font=font1, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        draw.text((540, 305), temp_min_ontem, font=font1, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        #Ponto de Orvalho
+        ponto_orvalho = float(list(dados_meteorologicos[dados_meteorologicos['ID_Estacao']== id_estacao]['Ponto Orvalho'])[0])
+        ponto_orvalho = str(ponto_orvalho) + "°C"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 35)
+        draw.text((300, 436), ponto_orvalho, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        #Sensação Termica
+        sensacao_termica = float(list(dados_meteorologicos[dados_meteorologicos['ID_Estacao']== id_estacao]['Sensacao Termica'])[0])
+        sensacao_termica = str(sensacao_termica) + "°C"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 35)
+        draw.text((630, 436), sensacao_termica, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        #Umidade
+        umidade = int(list(dados_meteorologicos[dados_meteorologicos['ID_Estacao']== id_estacao]['Umidade'])[0])
+        umidade = str(umidade) + "%"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 35)
+        draw.text((980, 436), umidade, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        #Evapotranpiração
+        evapo = float(list(dados_meteorologicos[dados_meteorologicos['ID_Estacao']== id_estacao]['Evapotranspiracao'])[0])
+        evapo = str(evapo) + " mm"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 35)
+        draw.text((1290, 456), evapo, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        #Chuva Hoje
+        chuva_hoje = float(list(dados_meteorologicos[dados_meteorologicos['ID_Estacao']== id_estacao]['Precipitacao Dia'])[0])
+        chuva_hoje = str(chuva_hoje) + " mm"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 35)
+        draw.text((280, 620), chuva_hoje, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        #Chuva Ontem
+        chuva_ontem = str(round(a['Chuva'].sum(),2)) + " mm"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 35)
+        draw.text((625, 620), chuva_ontem, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        #Chuva Mês Atual
+        b = dados_chuva_mes[dados_chuva_mes['ID_Estacao']==id_estacao]
+        chuva_mes = str(b['ChuvaMes'].iloc[0]) + " mm"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 35)
+        draw.text((950, 620), chuva_mes, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        #Chuva Safra - Período
+        chuva_safra = int(round(dados_chuva_safra[dados_chuva_safra['ID_Estacao']==id_estacao]["ChuvaSafra"].iloc[0],0))
+        chuva_safra = str(chuva_safra) + " mm"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 35)
+        draw.text((1290, 650), chuva_safra, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        
+        #GRÁFICOS
+        #Histórico Ultimos 7 dias
+        #Title Gráfico
+        title_grafico7 = "Gráfico Histórico - Últimos 7 dias"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 45)
+        draw.text((530, 700), title_grafico7, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        data_ontem = (datetime.now() - timedelta(days=1)).strftime('%d-%m-%Y')
+        
+        dados_x = [(datetime.now() - timedelta(days=7)).strftime('%d-%m-%Y'),(datetime.now() - timedelta(days=6)).strftime('%d-%m-%Y'),
+                   (datetime.now() - timedelta(days=5)).strftime('%d-%m-%Y'),(datetime.now() - timedelta(days=4)).strftime('%d-%m-%Y'),
+                   (datetime.now() - timedelta(days=3)).strftime('%d-%m-%Y'),(datetime.now() - timedelta(days=2)).strftime('%d-%m-%Y'),
+                   (datetime.now() - timedelta(days=1)).strftime('%d-%m-%Y')]
+        
+        #Extraindo Informações dos ultimos 7 dias por Estacao e por dia
+        
+        c = dados_meteorologicos_hora[(dados_meteorologicos_hora['ID_Estacao']==id_estacao)] 
+        tempMaxmedia = c['TempMax'].median()
+        tempMinmedia = c['TempMin'].median()
+        chuva_zero = 0
+        dados_y = [] #Temperaturas maximas
+        dados_y2 = []  #Temperaturas minimas
+        dados_y3 = [] #Chuva
+        for tmx in range(0,7):
+            #Temperaturas Maximas
+            tempmax = round(c[(c['DataLeitura']==dados_x[tmx])]['TempMax'].max(),1)
+            if np.isnan(tempmax) == True:
+                dados_y.append(tempMaxmedia)
+            else:
+                dados_y.append(tempmax)
+            
+            #Temperaturas Minimas
+            tempmin = round(c[(c['DataLeitura']==dados_x[tmx])]['TempMin'].min(),1)
+            if np.isnan(tempmin) == True:
+                dados_y2.append(tempMinmedia)
+            else:
+                dados_y2.append(tempmin)
+            
+            #Chuva
+            chuvagrafico = round(c[(c['DataLeitura']==dados_x[tmx])]['Chuva'].sum(),1)
+            if np.isnan(chuvagrafico) == True:
+                dados_y3.append(chuva_zero)
+            else:
+                dados_y3.append(chuvagrafico)
+        
+        total_chuva_ultimos7dias = sum(dados_y3)
+        
+        fig = go.Figure()
+        
+        # Adicionar traços do gráfico de linhas
+        fig.add_trace(go.Scatter(x=dados_x, y=dados_y, mode='lines', name='<b>Máximas ºC</b>', line=dict(color='red')))
+        fig.add_trace(go.Scatter(x=dados_x, y=dados_y2, mode='lines',name='<b>Mínimas °C</b>', line=dict(color='blue')))
+        
+        if total_chuva_ultimos7dias >0:
+            # Adicionar traço do gráfico de barras com rótulos de valor
+            fig.add_trace(go.Bar(
+                x=dados_x,
+                y=dados_y3,
+                name='<b>Índice Pluviométrico (mm)</b>',
+                text=dados_y3,
+                textposition='outside',
+                insidetextanchor='middle',
+                marker=dict(color='rgba(0, 0, 255, 0.7)'),
+                yaxis='y2'  # Aplicar o eixo secundário às barras
+            ))
+        
+        fig.update_layout(
+            #title="<b>Histórico - Últimos 7 dias</b>",
+            #title_font=dict(size=20),
+            title_x=0.5,
+            height=500,
+            width=950,
+            barmode='overlay',
+            yaxis=dict(title="<b>Temperatura (ºC)</b>"),
+            yaxis2=dict(title="<b>Índice Pluviométrico (mm)</b>", side="right", overlaying="y", showticklabels=True),
+            legend=dict(y=-0.15, orientation="h"),
+            xaxis=dict(tickfont=dict(size=14, family='Arial Bold'),title="Data"),
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            margin=dict(t=20)
+        )
+        
+        image_bytes = fig.to_image(format="png")
+        image = Image.open(io.BytesIO(image_bytes))
+        image = image.resize((1300, 450))
+        img.paste(image, (170,765))
+        
+        #Fonte Gráfico Histórico
+        fonte_grafico7 = "Fonte: Estações Meteorológicas Cocari"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 25)
+        draw.text((1070, 1180), fonte_grafico7, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        
+        #Previsão dos Próximos 7 dias
+        
+        municipio_previsao = " "+ dict_previsao_estacoes[str(id_estacao)]
+        #Title Previsao
+        title_previsao = "Previsão para os próximos 7 dias"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 45)
+        draw.text((530, 1280), title_previsao, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        dados_x = [(datetime.now() + timedelta(days=1)).strftime('%d-%m-%Y'),(datetime.now() + timedelta(days=2)).strftime('%d-%m-%Y'),
+                   (datetime.now() + timedelta(days=3)).strftime('%d-%m-%Y'),(datetime.now() + timedelta(days=4)).strftime('%d-%m-%Y'),
+                   (datetime.now() + timedelta(days=5)).strftime('%d-%m-%Y'),(datetime.now() + timedelta(days=6)).strftime('%d-%m-%Y'),
+                   (datetime.now() + timedelta(days=7)).strftime('%d-%m-%Y')]
+        
+        dados_y = [] #tempMax
+        dados_y2 = []#TempMin
+        dados_y3 = []  # Chuva
+        list_probabilidade = []
+        rotulos_previsao = []
+        
+        for i in range(0,7):
+            data = dados_x[i]
+            filtro = dados_previsao[dados_previsao['Municipio']== municipio_previsao]
+            data_filtro = data.replace('-', '/')
+            tempMax = filtro[filtro["Data"]==data_filtro]['TempMax'].iloc[0]
+            tempMin = filtro[filtro["Data"]==data_filtro]['TempMin'].iloc[0]
+            chuva = filtro[filtro["Data"]==data_filtro]['Chuva'].iloc[0]
+            probabilidade = filtro[filtro["Data"]==data_filtro]['Probabilidade'].iloc[0]
+            dados_y2.append(tempMin)
+            dados_y.append(tempMax)
+            list_probabilidade.append(probabilidade)
+            
+            if chuva >0:
+                rotulo = str(chuva) + "mm" + " | " + str(probabilidade)+"%"
+                rotulos_previsao.append(rotulo)
+            else:
+                rotulo = str(chuva) + "mm" + " | " +"0%"
+                rotulos_previsao.append(rotulo)
+            
+            if probabilidade >=sensibilidade_probabilidade:
+                dados_y3.append(chuva)
+            else:
+                dados_y3.append(0)
+                
+        total_chuva_previsao = sum(dados_y3)
+                
+        fig = go.Figure()
+        
+        # Adicionar traços do gráfico de linhas
+        fig.add_trace(go.Scatter(x=dados_x, y=dados_y, mode='lines', name='<b>Máximas ºC</b>', line=dict(color='red')))
+        fig.add_trace(go.Scatter(x=dados_x, y=dados_y2, mode='lines',name='<b>Mínimas °C</b>', line=dict(color='blue')))
+        
+        
+        # Adicionar traço do gráfico de barras com rótulos de valor
+        if total_chuva_previsao >0:
+            fig.add_trace(go.Bar(
+                x=dados_x,
+                y=dados_y3,
+                name='<b>Índice Pluviométrico (mm)</b>',
+                text=rotulos_previsao,
+                textposition='outside',
+                insidetextanchor='middle',
+                marker=dict(color='rgba(0, 0, 255, 0.7)'),
+                yaxis='y2'  # Aplicar o eixo secundário às barras
+            ))
+        
+        
+        fig.update_layout(
+            #title="<b>Histórico - Últimos 7 dias</b>",
+            #title_font=dict(size=20),
+            title_x=0.5,
+            height=500,
+            width=950,
+            barmode='overlay',
+            yaxis=dict(title="<b>Temperatura (ºC)</b>"),
+            yaxis2=dict(title="<b>Índice Pluviométrico (mm)</b>", side="right", overlaying="y", showticklabels=True),
+            legend=dict(y=-0.15, orientation="h"),
+            xaxis=dict(tickfont=dict(size=14, family='Arial Bold'),title="Data"),
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            margin=dict(t=20)
+        )
+        
+        image_bytes = fig.to_image(format="png")
+        image = Image.open(io.BytesIO(image_bytes))
+        image = image.resize((1300, 450))
+        img.paste(image, (170,1340))
+        
+        #Fonte Gráfico Previsao
+        fonte_previsao = "Fonte: Agroclima PRO"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 25)
+        draw.text((1210, 1750), fonte_previsao, font=font, fill=(0,99,56),stroke_width=1, stroke_fill=(0,99,56))
+        
+        
+        
+        
+        
+        
+        '''-------------------------------------------------------------------------------------'''
+                                 #SEÇÃO DE GERENCIAMENTO DE ALERTAS
+        '''-------------------------------------------------------------------------------------'''
+        #Controlador de Alertas
+        controlador_alertas = []
+        #Espaços alerta
+        espacos_alerta = [60, 1970, 850, 1970, 60, 2030, 850, 2030, 60, 2090, 850, 2090, 60, 2150, 850, 2150, 60, 2210, 850, 2210]
+        
+        #Cadastro de Alertas e Condições
+        #Sem Alerta
+        msgSemAlerta = "Não há alertas registrados para esta Estação Meteorológica"
+        font = ImageFont.truetype('calibrilight/calibril.ttf', 35)
+        
+        #Alerta Frio (01)
+        temp_min = min(dados_y2)
+        data_frio = dados_x[dados_y2.index(temp_min)].split("-")[0]
+        alerta_geada = f"Conforme os dados de previsão, há alerta de frio.\nEstima-se a temperatura mínima de {temp_min}°C\nno o dia {data_frio} para toda a região da filial. \nPodemos ver essa informação no gráfico acima."
+        
+        if temp_min <= alerta_frio:
+            controlador_alertas.append(alerta_geada)
+        
+        #---------------------------------------------------------------------------------------------------#
+        data_formatada = datetime.now()
+        #Importando Planilha de Alertas
+        doencas = pd.read_excel('Arquivos-essenciais/Cadastro_de_Doencas - New.xlsx')
+        #Filtando doenças da Safra
+        doencas = doencas[doencas['Cultura']==cultura_alerta]
+        #Filtando Grupo
+        grupo_relatorio = dados_estacoes_meteorologicas[dados_estacoes_meteorologicas["ID_Estacao"]==id_estacao]["GrupoFilial"].iloc[0]
+        doencas = doencas[doencas["GrupoFilial"]==grupo_relatorio]
+        #Filtrando Alertas Ativos
+        doencas = doencas[doencas["Ativo"]=="Sim"].reset_index(drop=True)
+        
+    
+        
+        for i in range(0,len(doencas)):
+            try:
+                tempo_molhamento = int(doencas['Molhamento(horas)'][i])
+                umidade = doencas["Umidade"][i]
+                tempo_inicial_dados = data_formatada - timedelta(hours=tempo_molhamento)
+                data_inicial = tempo_inicial_dados.strftime('%d-%m-%Y' ' %H:%M')
+                dados_clima = dados_meteorologicos_hora[dados_meteorologicos_hora['ID_Estacao']==id_estacao]
+                dados_clima['HoraCompleta'] = dados_clima['DataLeitura'] + " " +dados_clima['HoraLeitura'] 
+                dados_clima = dados_clima[dados_clima['HoraCompleta']>=data_inicial]
+                
+                
+                
+                #Ver se tem umidade
+                if umidade=="-":
+                    temperaturaMedia = dados_clima['TempMed']
+                    if (temperaturaMedia.max()<doencas["Temperatura Max"][i]) and (temperaturaMedia.min()<doencas["Temperatura Min"][i]):
+                        controlador_alertas.append(doencas["Texto do Alerta (max 210 caracteres)"][i])
+                    
+                elif umidade=="null":
+                    temperaturaMedia = dados_clima['TempMed']
+                    if (temperaturaMedia.max()<doencas["Temperatura Max"][i]) and (temperaturaMedia.min()<doencas["Temperatura Min"][i]):
+                        controlador_alertas.append(doencas["Texto do Alerta (max 210 caracteres)"][i])
+                
+                else: 
+                    umidade = doencas["Umidade"][i]
+                    medicao = umidade[0]
+                    valor = int(umidade[1::])
+                    if medicao == ">":
+                        temperaturaMedia = dados_clima['TempMed']
+                        umidadeMedia = dados_clima['Umidade']
+                        if (temperaturaMedia.max()<doencas["Temperatura Max"][i]) and (temperaturaMedia.min()<doencas["Temperatura Min"][i]\
+                                                                                       and (umidadeMedia.median()>valor)):
+                            controlador_alertas.append(doencas["Texto do Alerta (max 210 caracteres)"][i])
+                        elif medicao == "<":
+                            temperaturaMedia = dados_clima['TempMed']
+                            umidadeMedia = dados_clima['Umidade']
+                            if (temperaturaMedia.max()<doencas["Temperatura Max"][i]) and (temperaturaMedia.min()<doencas["Temperatura Min"][i]\
+                                                                                           and (umidadeMedia.median()<valor)):
+                                controlador_alertas.append(doencas["Texto do Alerta (max 210 caracteres)"][i])
+               
+            except:
+                print("ERRO NO ALERTA")
+       
+        
+        
+        #Aplicando Alertas
+        if len(controlador_alertas) == 0:
+            draw.text((60, 1970), msgSemAlerta, font=font, fill=(255,0,0),stroke_width=1, stroke_fill=(255,0,0))
+        else:
+            a=0
+            for i in range(0, min(len(controlador_alertas), 10)):
+                draw.text((espacos_alerta[0], espacos_alerta[1]), controlador_alertas[i].replace('\\n', '\n'), font=font, fill=(255,0,0),stroke_width=1, stroke_fill=(255,0,0))
+                del espacos_alerta[0]
+                del espacos_alerta[0]
+     
+        
+        
+        # Exibir a imagem
+        #img.show()
+        
+        # Salvar a imagem em um arquivo temporário
+        temp_filename = tempfile.NamedTemporaryFile(suffix=".png").name
+        img.save(temp_filename)
+        
+        # Criar um objeto FPDF
+        pdf = FPDF(unit='pt', format=(img.width, img.height))
+        
+        # Adicionar uma página ao PDF
+        pdf.add_page()
+        
+        # Adicionar a imagem à página inteira
+        pdf.image(temp_filename, x=0, y=0, w=pdf.w, h=pdf.h)
+        
+        # Salvar o PDF
+        pdf.output(f'Relatorios Meteorologicos/{nome_estacao}.pdf')
+        print(f"O relatório da Estação de {nome_estacao} foi gerado com Sucesso!!!")
+        
+    except:
+        print(f"O relatório da Estação de {nome_estacao} deu Erro!!!")
+        
+
+
+localizacao = pytz.timezone('America/Sao_Paulo')
+data_hora_atual = datetime.now(localizacao)
+data_fim = data_hora_atual.strftime('%d/%m/%Y' ' %H:%M:%S')
+data_fim_obj = datetime.strptime(data_fim, '%d/%m/%Y %H:%M:%S')
+
+diferenca_tempo = data_fim_obj - data_inicio_obj
+print("Tempo Total do Processo:", diferenca_tempo)
+        
